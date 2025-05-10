@@ -110,28 +110,37 @@ def jelly_active() -> int:
         return 0
 
 
-def tdarr(action: str) -> None:
+def tdarr_toggle_nodes(pause: bool) -> None:
     """
-    Sends a pause or resume command to Tdarr.
-
-    Args:
-        action (str): "Start" to resume or "Stop" to pause processing.
+    Toggles Tdarr’s global pauseAllNodes setting.
+    pause=True  → pause all nodes
+    pause=False → resume all nodes
     """
-    response = None  # Initialize response to None
-    request_body = {"processStatus": action}
+    body = {
+        "data": {
+            "collection": "SettingsGlobalJSONDB",
+            "mode":       "update",
+            "docID":      "globalsettings",
+            "obj": {
+                "pauseAllNodes": pause
+            }
+        },
+        "timeout": 20000
+    }
     try:
         response = requests.post(
-            f"{TDARR_URL}/api/v2/pauseProcessing",
-            json=request_body,
-            timeout=5,
+            f"{TDARR_URL}/api/v2/cruddb",
+            json=body,
+            timeout=5
         )
         response.raise_for_status()
-        logger.info(f"Tdarr action '{action}' sent successfully.")
+        action = "paused" if pause else "resumed"
+        logging.info(f"Tdarr nodes successfully {action}.")
     except requests.exceptions.RequestException as e:
         logger.error(f"Tdarr API request error: {e}", exc_info=True)
         _log_debug_request_exception_details(e)
     except Exception as e:
-        logger.error("Tdarr API unexpected error", exc_info=True)
+        logger.error(f"Tdarr API unexpected error: {e}", exc_info=True)
         _log_debug_response_details(response)
 
 
@@ -150,11 +159,11 @@ def main() -> None:
         playing = jelly_active()
         if playing > 0 and prev_state != "paused":
             logger.info(f"{playing} active video session(s) → pausing Tdarr")
-            tdarr("Stop")
+            tdarr_toggle_nodes(pause=True)
             prev_state = "paused"
         elif playing == 0 and prev_state != "running":
             logger.info("No active video sessions → resuming Tdarr")
-            tdarr("Start")
+            tdarr_toggle_nodes(pause=False)
             prev_state = "running"
         else:
             # Log current state if no change, useful for debugging or knowing it's still alive
