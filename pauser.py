@@ -99,7 +99,7 @@ def jelly_active() -> int:
         logger.error(f"Jellyfin API request error: {e}", exc_info=True)
         _log_debug_request_exception_details(e)
         return 0
-    except ValueError as e:  # Handles JSON decoding errors
+    except (requests.exceptions.JSONDecodeError, ValueError) as e:  # Handles JSON decoding errors
         logger.error(
             f"Jellyfin response JSON decoding error: {e}", exc_info=True)
         if logger.isEnabledFor(logging.DEBUG) and r is not None:
