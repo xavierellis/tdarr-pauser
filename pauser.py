@@ -379,6 +379,7 @@ def tdarr_requeue_paused_errors() -> None:
             except Exception as e_unexp:
                 logger.error("Unexpected report-parse error for %s: %s",
                              file_id, e_unexp, exc_info=True)
+                _log_debug_request_exception_details(e_rpt)
                 continue
 
             # ---- 3. re-queue this single row --------------------------------------
