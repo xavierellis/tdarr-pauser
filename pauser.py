@@ -246,6 +246,50 @@ def tdarr_cancel_active_workers() -> None:
             f"Unexpected error processing Tdarr nodes for worker cancellation: {e_unexp}", exc_info=True)
 
 
+def tdarr_requeue_file_by_id(file_id: str) -> None:
+    """
+    Fully re-queues a cancelled job using the correct dual-update method.
+    """
+    now_ms = int(time.time() * 1000)
+
+    updates = [
+        {
+            "collection": "FileJSONDB",
+            "mode": "update",
+            "docID": file_id,
+            "obj": {
+                "lastUpdate": now_ms
+            }
+        },
+        {
+            "collection": "FileJSONDB",
+            "mode": "update",
+            "docID": file_id,
+            "obj": {
+                "TranscodeDecisionMaker": "Queued",
+                "createdAt": now_ms
+            }
+        }
+    ]
+
+    for update in updates:
+        try:
+            resp = requests.post(
+                f"{TDARR_URL}/api/v2/cruddb",
+                json={"data": update, "timeout": 20000},
+                timeout=10
+            )
+            resp.raise_for_status()
+            logger.info("Updated '%s' with: %s", file_id, update["obj"])
+            _log_debug_response_details(resp)
+        except requests.exceptions.RequestException as e:
+            logger.error("Re-queue update failed for '%s': %s", file_id, e)
+            _log_debug_request_exception_details(e)
+        except Exception as e:
+            logger.error("Unexpected error updating '%s': %s",
+                         file_id, e, exc_info=True)
+
+
 def tdarr_requeue_paused_errors() -> None:
     """
     Re-queue ONLY those table-3 (Error/Cancelled) items whose job report
@@ -286,9 +330,10 @@ def tdarr_requeue_paused_errors() -> None:
             if row.get("processStatus") != "Cancelled":
                 continue
 
-            fp_id   = row.get("footprintId")           # present in table-3 rows :contentReference[oaicite:0]{index=0}:contentReference[oaicite:1]{index=1}
+            # present in table-3 rows :contentReference[oaicite:0]{index=0}:contentReference[oaicite:1]{index=1}
+            fp_id = row.get("footprintId")
             file_id = row.get("_id")
-            db_id   = row.get("DB")
+            db_id = row.get("DB")
 
             if not all([fp_id, file_id, db_id]):
                 logger.debug("Row missing key fields, skipping: %s", row)
@@ -297,7 +342,8 @@ def tdarr_requeue_paused_errors() -> None:
             # 2a. list report files for this footprint
             try:
                 list_rpts = requests.post(
-                    f"{TDARR_URL}/api/v2/list-footprintId-reports",         # :contentReference[oaicite:2]{index=2}:contentReference[oaicite:3]{index=3}
+                    # :contentReference[oaicite:2]{index=2}:contentReference[oaicite:3]{index=3}
+                    f"{TDARR_URL}/api/v2/list-footprintId-reports",
                     json={"data": {"footprintId": fp_id}},
                     timeout=10
                 )
@@ -315,11 +361,12 @@ def tdarr_requeue_paused_errors() -> None:
 
                 # 2b. read the report text
                 rpt_resp = requests.post(
-                    f"{TDARR_URL}/api/v2/read-job-file",                   # :contentReference[oaicite:4]{index=4}:contentReference[oaicite:5]{index=5}
+                    # :contentReference[oaicite:4]{index=4}:contentReference[oaicite:5]{index=5}
+                    f"{TDARR_URL}/api/v2/read-job-file",
                     json={"data": {
-                            "footprintId": fp_id,
-                            "jobId":       job_id,
-                            "jobFileId":   job_file_id
+                        "footprintId": fp_id,
+                        "jobId":       job_id,
+                        "jobFileId":   job_file_id
                     }},
                     timeout=10
                 )
@@ -340,41 +387,21 @@ def tdarr_requeue_paused_errors() -> None:
                 continue
 
             # ---- 3. re-queue this single row --------------------------------------
-            requeue_body = {
-                "data": {
-                    "dbID": db_id,
-                    "mode": "set",
-                    "table": "table3",
-                    "processStatus": "Queued",
-                    "opts": {"docID": file_id}
-                },
-                "timeout": 10000
-            }
-            try:
-                rq_resp = requests.post(
-                    f"{TDARR_URL}/api/v2/set-all-status",
-                    json=requeue_body, timeout=10
-                )
-                rq_resp.raise_for_status()
-                logger.info("Re-queued '%s' (library %s).", file_id, db_id)
-                _log_debug_response_details(rq_resp)
-            except requests.exceptions.RequestException as e_set:
-                logger.error("Failed to re-queue %s: %s", file_id, e_set)
-                _log_debug_request_exception_details(e_set)
-            except Exception as e_unexp_set:
-                logger.error("Unexpected re-queue error for %s: %s",
-                             file_id, e_unexp_set, exc_info=True)
+            tdarr_requeue_file_by_id(file_id)
+            logger.info("Re-queued file ID: %s from report %s",
+                        file_id, rpt_path)
 
     except requests.exceptions.RequestException as e_tbl:
         logger.error("Could not load Tdarr status-tables: %s", e_tbl)
         _log_debug_request_exception_details(e_tbl)
     except (requests.exceptions.JSONDecodeError, ValueError) as e_json:
-        logger.error("JSON decode error while reading table-3 rows: %s", e_json)
+        logger.error(
+            "JSON decode error while reading table-3 rows: %s", e_json)
         if err_rows_resp:
             logger.debug("Raw response text: %s", err_rows_resp.text)
     except Exception as e_outer:
-        logger.error("Unexpected error in tdarr_requeue_paused_errors", exc_info=True)
-
+        logger.error(
+            "Unexpected error in tdarr_requeue_paused_errors", exc_info=True)
 
 
 def main() -> None:
