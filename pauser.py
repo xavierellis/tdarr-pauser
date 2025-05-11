@@ -27,6 +27,8 @@ TDARR_URL: str = os.getenv("TDARR_URL", "http://tdarr-server:8266")
 POLL_SEC: int = int(os.getenv("POLL_SEC", "10"))
 LOG_LEVEL_STR: str = os.getenv("LOG_LEVEL", "INFO").upper()
 
+TDARR_CANCEL_CAUSE = "Paused by script due to Jellyfin activity"
+
 # Configure logging
 LOG_LEVEL = getattr(logging, LOG_LEVEL_STR, logging.INFO)
 logging.basicConfig(
@@ -195,7 +197,7 @@ def tdarr_cancel_active_workers() -> None:
                         "data": {
                             "nodeID": node_id,
                             "workerID": worker_id,
-                            "cause": "Paused by script due to Jellyfin activity"
+                            "cause": TDARR_CANCEL_CAUSE
                         }
                     }
                     cancel_response: Optional[requests.Response] = None
@@ -244,6 +246,137 @@ def tdarr_cancel_active_workers() -> None:
             f"Unexpected error processing Tdarr nodes for worker cancellation: {e_unexp}", exc_info=True)
 
 
+def tdarr_requeue_paused_errors() -> None:
+    """
+    Re-queue ONLY those table-3 (Error/Cancelled) items whose job report
+    contains the TDARR_CANCEL_CAUSE string set when we cancelled workers.
+
+    Strategy
+    --------
+    1.  Load rows from /api/v2/client/status-tables   (table3 = Error/Cancelled)
+    2.  For each Cancelled row:
+        •  use its footprintId with /api/v2/list-footprintId-reports
+        •  pick the most recent report filename
+        •  read that report via /api/v2/read-job-file
+        •  if the text contains TDARR_CANCEL_CAUSE → re-queue that one row
+    """
+    logger.info("Scanning Tdarr error table for script-cancelled jobs.")
+    err_rows_resp: Optional[requests.Response] = None
+
+    try:
+        # ---- 1. pull table-3 rows -------------------------------------------------
+        err_rows_payload = {
+            "data": {
+                "start": 0, "pageSize": 5000, "filters": [], "sorts": [],
+                "opts": {"table": "table3"}       # Error / Cancelled
+            }
+        }
+        err_rows_resp = requests.post(
+            f"{TDARR_URL}/api/v2/client/status-tables",
+            json=err_rows_payload, timeout=15
+        )
+        err_rows_resp.raise_for_status()
+        _log_debug_response_details(err_rows_resp)
+
+        rows = err_rows_resp.json().get("array", [])
+        logger.info("Fetched %d table-3 rows.", len(rows))
+
+        # ---- 2. iterate rows ------------------------------------------------------
+        for row in rows:
+            if row.get("processStatus") != "Cancelled":
+                continue
+
+            fp_id   = row.get("footprintId")           # present in table-3 rows :contentReference[oaicite:0]{index=0}:contentReference[oaicite:1]{index=1}
+            file_id = row.get("_id")
+            db_id   = row.get("DB")
+
+            if not all([fp_id, file_id, db_id]):
+                logger.debug("Row missing key fields, skipping: %s", row)
+                continue
+
+            # 2a. list report files for this footprint
+            try:
+                list_rpts = requests.post(
+                    f"{TDARR_URL}/api/v2/list-footprintId-reports",         # :contentReference[oaicite:2]{index=2}:contentReference[oaicite:3]{index=3}
+                    json={"data": {"footprintId": fp_id}},
+                    timeout=10
+                )
+                list_rpts.raise_for_status()
+                rpt_files = list_rpts.json()
+                if not rpt_files:
+                    logger.debug("No reports for %s – skipping.", fp_id)
+                    continue
+
+                # pick the newest file path (names are timestamps or have mtime ordering)
+                rpt_path = sorted(rpt_files)[-1]
+                # path looks like ".../<jobId>/<jobFileId>.log"
+                parts = rpt_path.replace("\\", "/").split("/")
+                job_id, job_file_id = parts[-2], parts[-1]
+
+                # 2b. read the report text
+                rpt_resp = requests.post(
+                    f"{TDARR_URL}/api/v2/read-job-file",                   # :contentReference[oaicite:4]{index=4}:contentReference[oaicite:5]{index=5}
+                    json={"data": {
+                            "footprintId": fp_id,
+                            "jobId":       job_id,
+                            "jobFileId":   job_file_id
+                    }},
+                    timeout=10
+                )
+                rpt_resp.raise_for_status()
+                rpt_text = rpt_resp.json().get("text", "")
+
+                if TDARR_CANCEL_CAUSE not in rpt_text:
+                    logger.debug("Job %s not cancelled by script.", file_id)
+                    continue   # genuine error – leave for manual review
+
+            except requests.exceptions.RequestException as e_rpt:
+                logger.error("Report fetch failed for %s: %s", file_id, e_rpt)
+                _log_debug_request_exception_details(e_rpt)
+                continue
+            except Exception as e_unexp:
+                logger.error("Unexpected report-parse error for %s: %s",
+                             file_id, e_unexp, exc_info=True)
+                continue
+
+            # ---- 3. re-queue this single row --------------------------------------
+            requeue_body = {
+                "data": {
+                    "dbID": db_id,
+                    "mode": "set",
+                    "table": "table3",
+                    "processStatus": "Queued",
+                    "opts": {"docID": file_id}
+                },
+                "timeout": 10000
+            }
+            try:
+                rq_resp = requests.post(
+                    f"{TDARR_URL}/api/v2/set-all-status",
+                    json=requeue_body, timeout=10
+                )
+                rq_resp.raise_for_status()
+                logger.info("Re-queued '%s' (library %s).", file_id, db_id)
+                _log_debug_response_details(rq_resp)
+            except requests.exceptions.RequestException as e_set:
+                logger.error("Failed to re-queue %s: %s", file_id, e_set)
+                _log_debug_request_exception_details(e_set)
+            except Exception as e_unexp_set:
+                logger.error("Unexpected re-queue error for %s: %s",
+                             file_id, e_unexp_set, exc_info=True)
+
+    except requests.exceptions.RequestException as e_tbl:
+        logger.error("Could not load Tdarr status-tables: %s", e_tbl)
+        _log_debug_request_exception_details(e_tbl)
+    except (requests.exceptions.JSONDecodeError, ValueError) as e_json:
+        logger.error("JSON decode error while reading table-3 rows: %s", e_json)
+        if err_rows_resp:
+            logger.debug("Raw response text: %s", err_rows_resp.text)
+    except Exception as e_outer:
+        logger.error("Unexpected error in tdarr_requeue_paused_errors", exc_info=True)
+
+
+
 def main() -> None:
     """
     Main loop that checks Jellyfin sessions and controls Tdarr accordingly.
@@ -265,7 +398,7 @@ def main() -> None:
         elif playing == 0 and prev_state != "running":
             logger.info("No active video sessions → resuming Tdarr")
             tdarr_toggle_nodes(pause=False)
-            # No need to uncancel workers here, as tdarr should pick them up automatically
+            tdarr_requeue_paused_errors()
             prev_state = "running"
         else:
             # Log current state if no change, useful for debugging or knowing it's still alive
