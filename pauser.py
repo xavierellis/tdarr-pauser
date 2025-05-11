@@ -351,9 +351,17 @@ def tdarr_requeue_paused_errors() -> None:
 
                 # pick the newest file path (names are timestamps or have mtime ordering)
                 rpt_path = sorted(rpt_files)[-1]
-                # path looks like ".../<jobId>/<jobFileId>.log"
-                parts = rpt_path.replace("\\", "/").split("/")
-                job_id, job_file_id = parts[-2], parts[-1]
+                # Tdarr report filenames look like:
+                # <footprintId>()<ver>()<type>()<jobId>()<jobFileId>.txt
+                parts = rpt_path.split("()")
+
+                if len(parts) < 5:
+                    logger.debug("Unrecognised report filename %s – skipping.", rpt_path)
+                    continue
+
+                # In this flat name the first part is still the footprintId we already have.
+                job_id      = parts[-2]                      # e.g. "-_Fxc73_U_" or "UyiVe5brp"
+                job_file_id = parts[-1]                      # e.g. "1746956369949.txt"
 
                 # 2b. read the report text
                 rpt_resp = requests.post(
