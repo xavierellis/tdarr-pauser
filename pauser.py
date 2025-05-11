@@ -327,10 +327,7 @@ def tdarr_requeue_paused_errors() -> None:
 
         # ---- 2. iterate rows ------------------------------------------------------
         for row in rows:
-            if row.get("processStatus") != "Cancelled":
-                continue
-
-            # present in table-3 rows :contentReference[oaicite:0]{index=0}:contentReference[oaicite:1]{index=1}
+        
             fp_id = row.get("footprintId")
             file_id = row.get("_id")
             db_id = row.get("DB")
@@ -342,7 +339,6 @@ def tdarr_requeue_paused_errors() -> None:
             # 2a. list report files for this footprint
             try:
                 list_rpts = requests.post(
-                    # :contentReference[oaicite:2]{index=2}:contentReference[oaicite:3]{index=3}
                     f"{TDARR_URL}/api/v2/list-footprintId-reports",
                     json={"data": {"footprintId": fp_id}},
                     timeout=10
@@ -361,7 +357,6 @@ def tdarr_requeue_paused_errors() -> None:
 
                 # 2b. read the report text
                 rpt_resp = requests.post(
-                    # :contentReference[oaicite:4]{index=4}:contentReference[oaicite:5]{index=5}
                     f"{TDARR_URL}/api/v2/read-job-file",
                     json={"data": {
                         "footprintId": fp_id,
