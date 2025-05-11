@@ -144,6 +144,106 @@ def tdarr_toggle_nodes(pause: bool) -> None:
         _log_debug_response_details(response)
 
 
+def tdarr_cancel_active_workers() -> None:
+    """
+    Identifies and cancels active transcode tasks on all Tdarr nodes.
+    This function assumes Tdarr nodes are already paused globally to prevent new tasks.
+    """
+    logger.info("Attempting to cancel active Tdarr worker tasks.")
+    get_nodes_response: Optional[requests.Response] = None
+    try:
+        get_nodes_response = requests.get(
+            f"{TDARR_URL}/api/v2/get-nodes", timeout=10)
+        get_nodes_response.raise_for_status()
+        nodes_data = get_nodes_response.json()
+        _log_debug_response_details(get_nodes_response)
+
+        cancelled_count = 0
+        if not isinstance(nodes_data, dict):
+            logger.warning(
+                f"Unexpected format for get-nodes response. Expected a dictionary, got {type(nodes_data)}. Cannot process workers.")
+            return
+
+        for node_id, node_info in nodes_data.items():
+            if not isinstance(node_info, dict):
+                logger.warning(
+                    f"Node data for '{node_id}' is not a dictionary. Skipping. Data: {node_info}")
+                continue
+
+            workers_obj = node_info.get('workers')
+            if not isinstance(workers_obj, dict):
+                logger.debug(
+                    f"Node '{node_id}' has no 'workers' dictionary or it's not in the expected format. Skipping. Workers data: {workers_obj}")
+                continue
+
+            for worker_id, worker_details in workers_obj.items():
+                if not isinstance(worker_details, dict):
+                    logger.warning(
+                        f"Worker details for '{worker_id}' on node '{node_id}' is not a dictionary. Skipping. Details: {worker_details}")
+                    continue
+
+                # Check if the worker is active by looking for a 'file' attribute.
+                # The presence of a 'file' key (and it not being None) indicates it's working on something.
+                # Also, worker_details.get('idle') == False could be an alternative or additional check.
+                active_file = worker_details.get('file')
+                is_active = active_file is not None
+
+                if is_active:
+                    logger.info(
+                        f"Found active worker: Node ID '{node_id}', Worker ID '{worker_id}'. File: '{active_file}'. Attempting to cancel.")
+                    cancel_payload = {
+                        "data": {
+                            "nodeID": node_id,
+                            "workerID": worker_id,
+                            "cause": "Paused by script due to Jellyfin activity"
+                        }
+                    }
+                    cancel_response: Optional[requests.Response] = None
+                    try:
+                        cancel_response = requests.post(
+                            f"{TDARR_URL}/api/v2/cancel-worker-item",
+                            json=cancel_payload,
+                            timeout=5
+                        )
+                        cancel_response.raise_for_status()
+                        logger.info(
+                            f"Successfully sent cancel request for worker '{worker_id}' on node '{node_id}'.")
+                        _log_debug_response_details(cancel_response)
+                        cancelled_count += 1
+                    except requests.exceptions.RequestException as e_cancel:
+                        logger.error(
+                            f"Error cancelling worker '{worker_id}' on node '{node_id}': {e_cancel}")
+                        _log_debug_request_exception_details(e_cancel)
+                    except Exception as e_unexp_cancel:
+                        logger.error(
+                            f"Unexpected error cancelling worker '{worker_id}' on node '{node_id}': {e_unexp_cancel}", exc_info=True)
+                        if cancel_response:
+                            _log_debug_response_details(cancel_response)
+                else:
+                    logger.debug(
+                        f"Worker '{worker_id}' on node '{node_id}' is not active (no 'file' attribute or 'file' is None). Skipping cancellation.")
+
+        if cancelled_count > 0:
+            logger.info(
+                f"Attempted to cancel {cancelled_count} active Tdarr worker tasks.")
+        else:
+            logger.info(
+                "No active Tdarr worker tasks found to cancel, or worker data structure was not as expected.")
+
+    except requests.exceptions.RequestException as e:
+        logger.error(
+            f"Error fetching Tdarr nodes for worker cancellation: {e}")
+        _log_debug_request_exception_details(e)
+    except (requests.exceptions.JSONDecodeError, ValueError) as e_json:
+        logger.error(f"Error decoding Tdarr nodes response: {e_json}")
+        if get_nodes_response:
+            logger.debug(
+                f"Response Text (non-JSON from get-nodes): {get_nodes_response.text}")
+    except Exception as e_unexp:
+        logger.error(
+            f"Unexpected error processing Tdarr nodes for worker cancellation: {e_unexp}", exc_info=True)
+
+
 def main() -> None:
     """
     Main loop that checks Jellyfin sessions and controls Tdarr accordingly.
@@ -160,10 +260,12 @@ def main() -> None:
         if playing > 0 and prev_state != "paused":
             logger.info(f"{playing} active video session(s) → pausing Tdarr")
             tdarr_toggle_nodes(pause=True)
+            tdarr_cancel_active_workers()
             prev_state = "paused"
         elif playing == 0 and prev_state != "running":
             logger.info("No active video sessions → resuming Tdarr")
             tdarr_toggle_nodes(pause=False)
+            # No need to uncancel workers here, as tdarr should pick them up automatically
             prev_state = "running"
         else:
             # Log current state if no change, useful for debugging or knowing it's still alive
