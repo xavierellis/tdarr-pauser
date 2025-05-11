@@ -65,51 +65,55 @@ def _log_debug_response_details(response: Optional[requests.Response]):
 
 def jelly_active() -> int:
     """
-    Checks for active (not paused) video sessions in Jellyfin.
+    Returns the number of *actively-playing, transcoding* video sessions in Jellyfin.
 
-    Returns:
-        int: The number of active video sessions.
+    A session is counted when:
+        • play_state.IsPaused       is False
+        • NowPlayingItem.MediaType  is "Video"
+        • TranscodingInfo           is not None   (i.e. Jellyfin is transcoding)
     """
-    r = None  # Initialize r to None
+    r: Optional[requests.Response] = None
     try:
         r = requests.get(f"{JELLY_URL}/Sessions", headers=headers, timeout=5)
         r.raise_for_status()
         sessions = r.json()
 
-        logger.info(f"Found {len(sessions)} sessions")
+        logger.info("Found %d sessions", len(sessions))
 
         active_count = 0
         for s in sessions:
-            client = s.get("Client", "Unknown")
-            username = s.get("UserName", "Unknown")
-            play_state = s.get("PlayState", {})
-            is_paused = play_state.get("IsPaused")
-            now_playing_item = s.get("NowPlayingItem", {})
-            now_playing_media_type = now_playing_item.get("MediaType")
+            client        = s.get("Client", "Unknown")
+            username      = s.get("UserName", "Unknown")
+            play_state    = s.get("PlayState", {})
+            is_paused     = play_state.get("IsPaused")
+            now_playing   = s.get("NowPlayingItem", {})
+            media_type    = now_playing.get("MediaType")
+            transcoding   = s.get("TranscodingInfo") is not None
 
             logger.debug(
-                f"Session: {username} on {client}, Paused: {is_paused}, NowPlayingMediaType: {now_playing_media_type}"
+                "Session: %s on %s | Paused: %s | MediaType: %s | Transcoding: %s",
+                username, client, is_paused, media_type, transcoding
             )
 
-            # A session is active if it's not paused AND it's a Video type
-            if is_paused is False and now_playing_media_type == "Video":
+            if (not is_paused) and media_type == "Video" and transcoding:
                 active_count += 1
-                logger.debug(f"↑ Counted as active: {username} on {client}")
+                logger.debug("↑ Counted as active")
 
         return active_count
+
     except requests.exceptions.RequestException as e:
-        logger.error(f"Jellyfin API request error: {e}", exc_info=True)
+        logger.error("Jellyfin API request error: %s", e, exc_info=True)
         _log_debug_request_exception_details(e)
         return 0
-    except (requests.exceptions.JSONDecodeError, ValueError) as e:  # Handles JSON decoding errors
-        logger.error(
-            f"Jellyfin response JSON decoding error: {e}", exc_info=True)
-        if logger.isEnabledFor(logging.DEBUG) and r is not None:
-            logger.debug(f"Response Text (non-JSON): {r.text}")
+    except (requests.exceptions.JSONDecodeError, ValueError) as e:
+        logger.error("Jellyfin response JSON decode error: %s", e, exc_info=True)
+        if r is not None:
+            logger.debug("Response text (non-JSON): %s", r.text)
         return 0
     except Exception as e:
-        logger.error("Jellyfin query unexpected error", exc_info=True)
+        logger.error("Unexpected error in jelly_active", exc_info=True)
         return 0
+
 
 
 def tdarr_toggle_nodes(pause: bool) -> None:
