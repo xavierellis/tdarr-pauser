@@ -38,7 +38,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-headers: Dict[str, str] = {"X-Emby-Token": JELLY_KEY} if JELLY_KEY else {}
+headers: Dict[str, str] = (
+    {"Authorization": f'MediaBrowser Token="{JELLY_KEY}"'} if JELLY_KEY else {}
+)
 
 
 def _log_debug_request_exception_details(e: requests.exceptions.RequestException):
